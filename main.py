@@ -1,4 +1,4 @@
-# app.py - Clean FastAPI Behavioral Fraud Detection Backend
+# main.py - Complete Enhanced Fraud Detection with Ollama Agents
 import os
 import json
 import logging
@@ -19,14 +19,9 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 # Database
-from sqlalchemy import create_engine, Column, String, DateTime, Float, Integer, Boolean, Text, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy import create_engine, Column, String, DateTime, Float, Integer, Boolean, Text, ForeignKey, text
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from sqlalchemy.pool import StaticPool
-
-# Redis and Celery
-import redis.asyncio as aioredis
-from celery import Celery
 
 # ML libraries
 import numpy as np
@@ -37,10 +32,30 @@ from sklearn.svm import OneClassSVM
 import joblib
 from scipy import stats
 
+# Redis and Celery
+try:
+    import redis.asyncio as aioredis
+    from celery import Celery
+    CELERY_AVAILABLE = True
+except ImportError:
+    CELERY_AVAILABLE = False
+
+# Agent libraries
+try:
+    import ollama
+    # Try new import first, fall back to deprecated one
+    try:
+        from langchain_ollama import OllamaLLM as Ollama
+    except ImportError:
+        from langchain_community.llms import Ollama
+    AGENTS_AVAILABLE = True
+except ImportError:
+    AGENTS_AVAILABLE = False
+
 # Configuration
 class Settings:
-    app_name = "Behavioral Fraud Detection API"
-    version = "1.0.0"
+    app_name = "Behavioral Fraud Detection API with AI Agents"
+    version = "2.0.0"
     debug = True
     
     database_url = os.getenv("DATABASE_URL", "sqlite:///./fraud_detection.db")
@@ -50,8 +65,19 @@ class Settings:
     anomaly_threshold = 0.6
     min_training_samples = 50
     max_session_duration = 3600
+    
+    # Ollama settings
+    ollama_model = "llama3:latest"
+    ollama_base_url = "http://localhost:11434"
 
 settings = Settings()
+
+# Early logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Database Setup
 engine = create_engine(
@@ -113,6 +139,7 @@ class EventResponse(BaseModel):
     anomaly_detected: bool = False
     risk_score: float = 0.0
     risk_level: str = "low"
+    agent_analysis: Optional[Dict[str, Any]] = None
 
 # Data Classes
 @dataclass
@@ -158,6 +185,8 @@ class BehavioralSession(Base):
     session_start = Column(DateTime, default=datetime.utcnow)
     session_end = Column(DateTime)
     ip_address = Column(String(45))
+    user_agent = Column(Text)
+    device_fingerprint = Column(Text)
     risk_score = Column(Float, default=0.0)
     anomaly_count = Column(Integer, default=0)
     is_flagged = Column(Boolean, default=False)
@@ -181,18 +210,37 @@ class AnomalyAlert(Base):
     
     session = relationship("BehavioralSession", back_populates="anomaly_alerts")
 
+class AgentAssessment(Base):
+    __tablename__ = "agent_assessments"
+    
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String(36), ForeignKey('behavioral_sessions.id'), nullable=False)
+    agent_type = Column(String(50), nullable=False)
+    assessment_data = Column(Text, nullable=False)
+    confidence = Column(Float, default=0.0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 # Feature Engineering
 class BehavioralFeatureExtractor:
     def __init__(self):
         self.scaler = RobustScaler()
     
+    def _get_default_features(self) -> Dict[str, float]:
+        """Return default feature values when no data is available"""
+        return {
+            'dwell_mean': 0.0,
+            'dwell_std': 0.0,
+            'flight_mean': 0.0,
+            'flight_std': 0.0,
+            'typing_speed': 0.0,
+            'rhythm_consistency': 0.0,
+            'keystroke_entropy': 0.0
+        }
+    
     def extract_keystroke_features(self, keystroke_data: List[KeystrokeDynamics]) -> Dict[str, float]:
         """Extract keystroke dynamics features"""
         if not keystroke_data or len(keystroke_data) < 2:
-            return {
-                'dwell_mean': 0.0, 'dwell_std': 0.0, 'flight_mean': 0.0, 'flight_std': 0.0,
-                'typing_speed': 0.0, 'rhythm_consistency': 0.0, 'keystroke_entropy': 0.0
-            }
+            return self._get_default_features()
         
         dwell_times = [k.dwell_time for k in keystroke_data if k.dwell_time > 0]
         flight_times = [k.flight_time for k in keystroke_data if k.flight_time > 0]
@@ -353,14 +401,114 @@ class AnomalyDetectionEngine:
     
     async def detect_anomaly(self, user_id: str, current_data: Dict) -> Dict[str, Any]:
         """Detect anomalies in current behavioral data"""
-        if not self.models_trained:
+        try:
+            # Quick rule-based detection for immediate results
+            keystrokes = current_data.get('keystrokes', [])
+            mouse_data = current_data.get('mouse', [])
+            
+            # Bot detection based on keystroke patterns
+            if keystrokes and len(keystrokes) >= 3:
+                recent_keystrokes = keystrokes[-10:]
+                
+                dwell_times = [k.dwell_time for k in recent_keystrokes if k.dwell_time > 0]
+                flight_times = [k.flight_time for k in recent_keystrokes if k.flight_time > 0]
+                
+                if dwell_times and flight_times:
+                    avg_dwell = sum(dwell_times) / len(dwell_times)
+                    avg_flight = sum(flight_times) / len(flight_times)
+                    
+                    # Bot detection - very short timing patterns
+                    if avg_dwell < 20 or avg_flight < 15:
+                        return {
+                            'anomaly_score': 0.95,
+                            'is_anomaly': True,
+                            'confidence': 0.95,
+                            'risk_level': 'critical',
+                            'reason': 'bot_detection'
+                        }
+                    
+                    # Consistency check - too uniform is suspicious
+                    dwell_consistency = np.std(dwell_times) / (np.mean(dwell_times) + 1e-6)
+                    flight_consistency = np.std(flight_times) / (np.mean(flight_times) + 1e-6)
+                    
+                    if dwell_consistency < 0.1 and flight_consistency < 0.1:
+                        return {
+                            'anomaly_score': 0.85,
+                            'is_anomaly': True,
+                            'confidence': 0.8,
+                            'risk_level': 'high',
+                            'reason': 'too_consistent'
+                        }
+            
+            # Mouse behavior anomaly detection
+            if mouse_data and len(mouse_data) >= 5:
+                recent_mouse = mouse_data[-10:]
+                velocities = [m.velocity for m in recent_mouse if m.velocity >= 0]
+                
+                if velocities:
+                    avg_velocity = sum(velocities) / len(velocities)
+                    
+                    # Extremely fast or slow mouse movement
+                    if avg_velocity > 1000:  # Too fast
+                        return {
+                            'anomaly_score': 0.8,
+                            'is_anomaly': True,
+                            'confidence': 0.75,
+                            'risk_level': 'high',
+                            'reason': 'erratic_mouse'
+                        }
+                    
+                    # Check for linear patterns (bot-like)
+                    x_coords = [m.x for m in recent_mouse]
+                    y_coords = [m.y for m in recent_mouse]
+                    
+                    if len(set(x_coords)) <= 2 or len(set(y_coords)) <= 2:
+                        return {
+                            'anomaly_score': 0.9,
+                            'is_anomaly': True,
+                            'confidence': 0.85,
+                            'risk_level': 'critical',
+                            'reason': 'linear_mouse_pattern'
+                        }
+            
+            # ML-based detection if models are trained
+            if self.models_trained and (keystrokes or mouse_data):
+                ml_result = await self._ml_anomaly_detection(user_id, current_data)
+                if ml_result.get('is_anomaly'):
+                    return ml_result
+            
+            # Baseline comparison
+            if user_id in self.baseline_profiles:
+                baseline_score = self._compare_with_baseline(user_id, current_data)
+                if baseline_score > 0.7:
+                    return {
+                        'anomaly_score': baseline_score,
+                        'is_anomaly': True,
+                        'confidence': 0.7,
+                        'risk_level': 'medium',
+                        'reason': 'baseline_deviation'
+                    }
+            
+            return {
+                'anomaly_score': 0.1,
+                'is_anomaly': False,
+                'confidence': 0.9,
+                'risk_level': 'low',
+                'reason': 'normal_behavior'
+            }
+            
+        except Exception as e:
+            logger.error(f"Anomaly detection failed: {str(e)}")
             return {
                 'anomaly_score': 0.0,
                 'is_anomaly': False,
                 'confidence': 0.0,
-                'risk_level': 'low'
+                'risk_level': 'low',
+                'reason': 'detection_error'
             }
-        
+    
+    async def _ml_anomaly_detection(self, user_id: str, current_data: Dict) -> Dict[str, Any]:
+        """ML-based anomaly detection"""
         try:
             # Extract features
             keystroke_features = self.feature_extractor.extract_keystroke_features(
@@ -371,86 +519,181 @@ class AnomalyDetectionEngine:
             )
             
             combined_features = {**keystroke_features, **mouse_features}
+            if not combined_features or not any(v != 0 for v in combined_features.values()):
+                return {'is_anomaly': False, 'anomaly_score': 0.0}
             
-            if not combined_features or all(v == 0 for v in combined_features.values()):
-                return {
-                    'anomaly_score': 0.0,
-                    'is_anomaly': False,
-                    'confidence': 0.0,
-                    'risk_level': 'low'
-                }
-            
-            # Prepare for prediction
+            # Prepare feature vector
             feature_vector = np.array(list(combined_features.values())).reshape(1, -1)
             scaled_features = self.scaler.transform(feature_vector)
             
             # Get predictions
             isolation_score = self.isolation_forest.decision_function(scaled_features)[0]
-            isolation_anomaly = self.isolation_forest.predict(scaled_features)[0] == -1
+            isolation_pred = self.isolation_forest.predict(scaled_features)[0]
             
-            svm_score = 0.0
-            svm_anomaly = False
-            if self.one_class_svm:
-                svm_score = self.one_class_svm.decision_function(scaled_features)[0]
-                svm_anomaly = self.one_class_svm.predict(scaled_features)[0] == -1
-            
-            # Baseline comparison
-            baseline_score = self._compare_with_baseline(user_id, feature_vector[0])
+            svm_pred = self.one_class_svm.predict(scaled_features)[0] if self.one_class_svm else 1
             
             # Combine scores
-            final_score = (abs(isolation_score) * 0.4 + abs(svm_score) * 0.3 + baseline_score * 0.3)
-            is_anomaly = isolation_anomaly or svm_anomaly or baseline_score > 0.7
-            confidence = min(abs(final_score), 1.0)
+            is_anomaly = isolation_pred == -1 or svm_pred == -1
+            anomaly_score = max(0, min(1, (0.5 - isolation_score) * 2))  # Normalize to 0-1
             
-            # Risk level
-            if not is_anomaly and final_score < 0.3:
-                risk_level = 'low'
-            elif final_score < 0.6:
-                risk_level = 'medium'
-            elif final_score < 0.8:
-                risk_level = 'high'
-            else:
+            risk_level = 'low'
+            if anomaly_score > 0.8:
                 risk_level = 'critical'
-            
-            # Update history
-            self.anomaly_history[user_id].append(final_score)
-            if len(self.anomaly_history[user_id]) > 100:
-                self.anomaly_history[user_id].popleft()
+            elif anomaly_score > 0.6:
+                risk_level = 'high'
+            elif anomaly_score > 0.4:
+                risk_level = 'medium'
             
             return {
-                'anomaly_score': float(final_score),
-                'is_anomaly': bool(is_anomaly),
-                'confidence': float(confidence),
-                'risk_level': risk_level
+                'anomaly_score': anomaly_score,
+                'is_anomaly': is_anomaly,
+                'confidence': 0.8,
+                'risk_level': risk_level,
+                'reason': 'ml_detection'
             }
             
         except Exception as e:
-            logger.error(f"Anomaly detection failed: {str(e)}")
-            return {
-                'anomaly_score': 0.0,
-                'is_anomaly': False,
-                'confidence': 0.0,
-                'risk_level': 'low'
-            }
+            logger.error(f"ML detection failed: {str(e)}")
+            return {'is_anomaly': False, 'anomaly_score': 0.0}
     
-    def _compare_with_baseline(self, user_id: str, features: np.ndarray) -> float:
-        """Compare with user baseline"""
+    def _compare_with_baseline(self, user_id: str, current_data: Dict) -> float:
+        """Compare current behavior with user baseline"""
         if user_id not in self.baseline_profiles:
             return 0.0
         
-        baseline = self.baseline_profiles[user_id]
-        z_scores = []
-        
-        for i, value in enumerate(features):
-            if i < len(baseline['std']) and baseline['std'][i] > 0:
-                z_score = abs(value - baseline['mean'][i]) / baseline['std'][i]
-                z_scores.append(z_score)
-        
-        if not z_scores:
+        try:
+            # Extract current features
+            keystroke_features = self.feature_extractor.extract_keystroke_features(
+                current_data.get('keystrokes', [])
+            )
+            mouse_features = self.feature_extractor.extract_mouse_features(
+                current_data.get('mouse', [])
+            )
+            
+            combined_features = {**keystroke_features, **mouse_features}
+            if not combined_features:
+                return 0.0
+            
+            features = np.array(list(combined_features.values()))
+            baseline = self.baseline_profiles[user_id]
+            
+            # Calculate z-scores
+            z_scores = []
+            for i, value in enumerate(features):
+                if i < len(baseline['std']) and baseline['std'][i] > 0:
+                    z_score = abs(value - baseline['mean'][i]) / baseline['std'][i]
+                    z_scores.append(z_score)
+            
+            if not z_scores:
+                return 0.0
+            
+            # Count anomalous features (z-score > 2)
+            anomalous_features = sum(1 for z in z_scores if z > 2.0)
+            return anomalous_features / len(z_scores)
+            
+        except Exception as e:
+            logger.error(f"Baseline comparison failed: {str(e)}")
             return 0.0
+
+# AI Security Agent
+class SecurityAgent:
+    def __init__(self):
+        if not AGENTS_AVAILABLE:
+            self.available = False
+            logger.warning("Agent libraries not available. Install: pip install ollama langchain langchain-community")
+            return
+            
+        try:
+            self.llm = Ollama(model="llama3:latest", base_url="http://localhost:11434")
+            self.available = True
+            logger.info("SecurityAgent initialized with llama3:latest")
+        except Exception as e:
+            logger.warning(f"SecurityAgent initialization failed: {e}")
+            self.available = False
+    
+    async def analyze_behavioral_risk(self, session_data: Dict) -> Dict[str, Any]:
+        """Analyze behavioral data using AI agent"""
+        if not self.available:
+            return {"error": "Agent not available", "fallback": True}
         
-        anomalous_features = sum(1 for z in z_scores if z > 2.0)
-        return anomalous_features / len(z_scores)
+        try:
+            behavioral_summary = self._prepare_behavioral_summary(session_data)
+            
+            prompt = f"""You are a cybersecurity expert analyzing user behavioral patterns for fraud detection.
+
+Behavioral Data:
+{json.dumps(behavioral_summary, indent=2)}
+
+Analyze this data for fraud indicators:
+1. Keystroke timing patterns (normal human dwell: 80-150ms, flight: 50-200ms)
+2. Mouse movement patterns (velocity, acceleration, linearity)
+3. Overall behavioral consistency
+
+Provide assessment in JSON format:
+{{"risk_level": "low", "confidence": 0.8, "primary_concerns": ["issues"], "reasoning": "explanation", "recommendations": ["actions"]}}
+
+Respond ONLY with valid JSON."""
+            
+            response = await asyncio.to_thread(self.llm.invoke, prompt)
+            
+            try:
+                analysis = json.loads(response.strip())
+                analysis["agent_model"] = "llama3:latest"
+                analysis["timestamp"] = datetime.utcnow().isoformat()
+                return analysis
+            except json.JSONDecodeError:
+                return {
+                    "risk_level": "unknown",
+                    "confidence": 0.5,
+                    "reasoning": response[:200],
+                    "agent_model": "llama3:latest",
+                    "parsing_error": True
+                }
+                
+        except Exception as e:
+            logger.error(f"Agent analysis failed: {str(e)}")
+            return {"error": str(e), "agent_model": "llama3:latest"}
+    
+    def _prepare_behavioral_summary(self, session_data: Dict) -> Dict[str, Any]:
+        keystrokes = session_data.get('keystrokes', [])
+        mouse_events = session_data.get('mouse', [])
+        
+        summary = {
+            "session_stats": {
+                "keystroke_count": len(keystrokes),
+                "mouse_event_count": len(mouse_events),
+                "session_duration": time.time() - session_data.get('start_time', time.time()),
+                "current_risk_score": session_data.get('risk_score', 0.0),
+                "anomaly_count": session_data.get('anomaly_count', 0)
+            }
+        }
+        
+        if keystrokes:
+            recent = keystrokes[-10:]
+            dwell_times = [k.dwell_time for k in recent if hasattr(k, 'dwell_time') and k.dwell_time > 0]
+            flight_times = [k.flight_time for k in recent if hasattr(k, 'flight_time') and k.flight_time > 0]
+            
+            if dwell_times and flight_times:
+                summary["keystroke_patterns"] = {
+                    "avg_dwell_time": sum(dwell_times) / len(dwell_times),
+                    "avg_flight_time": sum(flight_times) / len(flight_times),
+                    "dwell_std": np.std(dwell_times),
+                    "consistency_ratio": np.std(dwell_times) / (np.mean(dwell_times) + 1e-6)
+                }
+        
+        if mouse_events:
+            recent_mouse = mouse_events[-10:]
+            velocities = [m.velocity for m in recent_mouse if hasattr(m, 'velocity') and m.velocity >= 0]
+            
+            if velocities:
+                summary["mouse_patterns"] = {
+                    "avg_velocity": sum(velocities) / len(velocities),
+                    "velocity_std": np.std(velocities),
+                    "max_velocity": max(velocities),
+                    "movement_count": len(recent_mouse)
+                }
+        
+        return summary
 
 # Real-time Processor
 class RealTimeProcessor:
@@ -559,15 +802,20 @@ class RealTimeProcessor:
                 return {
                     'anomaly_detected': detection_result['is_anomaly'],
                     'risk_score': detection_result['anomaly_score'],
-                    'confidence': detection_result['confidence'],
+                    'confidence': detection_result.get('confidence', 0.0),
                     'risk_level': detection_result['risk_level']
                 }
                 
             except Exception as e:
                 logger.error(f"Anomaly detection failed: {str(e)}")
-                return {'anomaly_detected': False}
+                return {'anomaly_detected': False, 'risk_score': 0.0, 'risk_level': 'low'}
         
-        return {'anomaly_detected': False, 'reason': 'insufficient_data'}
+        return {
+            'anomaly_detected': False, 
+            'risk_score': session.get('risk_score', 0.0),
+            'risk_level': 'low',
+            'reason': 'insufficient_data'
+        }
     
     async def _store_anomaly_alert(self, session_id: str, detection_result: Dict, db: Session):
         """Store anomaly alert"""
@@ -575,7 +823,7 @@ class RealTimeProcessor:
             alert = AnomalyAlert(
                 session_id=session_id,
                 anomaly_type='behavioral',
-                confidence_score=detection_result['confidence'],
+                confidence_score=detection_result.get('confidence', 0.0),
                 severity=detection_result['risk_level'],
                 details=json.dumps(detection_result)
             )
@@ -587,12 +835,68 @@ class RealTimeProcessor:
             await websocket_manager.broadcast_alert({
                 'session_id': session_id,
                 'risk_level': detection_result['risk_level'],
-                'confidence': detection_result['confidence'],
-                'timestamp': datetime.utcnow().isoformat()
+                'confidence': detection_result.get('confidence', 0.0),
+                'timestamp': datetime.utcnow().isoformat(),
+                'reason': detection_result.get('reason', 'unknown')
             })
             
         except Exception as e:
             logger.error(f"Alert storage failed: {str(e)}")
+            db.rollback()
+
+# Enhanced Real-time Processor with Agent Integration
+class EnhancedRealTimeProcessor(RealTimeProcessor):
+    def __init__(self):
+        super().__init__()
+        self.security_agent = SecurityAgent() if AGENTS_AVAILABLE else None
+        self.stats['agent_analyses'] = 0
+    
+    async def process_behavioral_event_with_agent(self, event_data: Dict, db: Session) -> Dict[str, Any]:
+        """Process events with AI agent analysis"""
+        
+        # First run the standard processing
+        standard_result = await super().process_behavioral_event(event_data, db)
+        
+        session_id = event_data.get('session_id')
+        session_data = self.active_sessions.get(session_id, {})
+        
+        # Run AI agent analysis periodically or on anomalies
+        total_events = len(session_data.get('keystrokes', [])) + len(session_data.get('mouse', []))
+        agent_analysis = None
+        
+        if (total_events > 0 and total_events % 25 == 0) or standard_result.get('anomaly_detected'):
+            if self.security_agent and self.security_agent.available:
+                try:
+                    agent_analysis = await self.security_agent.analyze_behavioral_risk(session_data)
+                    self.stats['agent_analyses'] += 1
+                    
+                    # Store agent assessment
+                    await self._store_agent_assessment(session_id, agent_analysis, db)
+                    
+                except Exception as e:
+                    logger.error(f"Agent analysis failed: {str(e)}")
+                    agent_analysis = {"error": "Agent analysis failed"}
+        
+        if agent_analysis:
+            standard_result['agent_analysis'] = agent_analysis
+        
+        return standard_result
+    
+    async def _store_agent_assessment(self, session_id: str, assessment: Dict, db: Session):
+        """Store AI agent assessment"""
+        try:
+            agent_assessment = AgentAssessment(
+                session_id=session_id,
+                agent_type='security_agent',
+                assessment_data=json.dumps(assessment),
+                confidence=assessment.get('confidence', 0.0)
+            )
+            
+            db.add(agent_assessment)
+            db.commit()
+            
+        except Exception as e:
+            logger.error(f"Failed to store agent assessment: {str(e)}")
             db.rollback()
 
 # WebSocket Manager
@@ -601,19 +905,16 @@ class WebSocketManager:
         self.active_connections: List[WebSocket] = []
     
     async def connect(self, websocket: WebSocket):
-        """Connect WebSocket"""
         await websocket.accept()
         self.active_connections.append(websocket)
         logger.info(f"WebSocket connected. Total: {len(self.active_connections)}")
     
     def disconnect(self, websocket: WebSocket):
-        """Disconnect WebSocket"""
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
         logger.info(f"WebSocket disconnected. Total: {len(self.active_connections)}")
     
     async def broadcast_alert(self, alert_data: Dict):
-        """Broadcast alert to all connections"""
         if not self.active_connections:
             return
         
@@ -623,63 +924,65 @@ class WebSocketManager:
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
-            except:
+            except Exception as e:
+                logger.error(f"WebSocket send failed: {str(e)}")
                 disconnected.append(connection)
         
         for conn in disconnected:
             self.disconnect(conn)
 
 # Initialize global instances
-real_time_processor = RealTimeProcessor()
+enhanced_processor = EnhancedRealTimeProcessor()
 websocket_manager = WebSocketManager()
 
 # Celery setup
-celery_app = Celery(
-    "fraud_detection",
-    broker=settings.celery_broker_url,
-    backend=settings.celery_broker_url
-)
+if CELERY_AVAILABLE:
+    celery_app = Celery(
+        "fraud_detection",
+        broker=settings.celery_broker_url,
+        backend=settings.celery_broker_url
+    )
 
-@celery_app.task
-def train_user_models(user_id: str):
-    """Background task to train models"""
-    logger.info(f"Training models for user {user_id}")
-    
-    try:
-        db = SessionLocal()
-        user = db.query(User).filter(User.id == user_id).first()
+    @celery_app.task
+    def train_user_models(user_id: str):
+        """Background task to train models"""
+        logger.info(f"Training models for user {user_id}")
         
-        if not user:
+        try:
+            db = SessionLocal()
+            user = db.query(User).filter(User.id == user_id).first()
+            
+            if not user:
+                return False
+            
+            # Get training data
+            sessions = db.query(BehavioralSession).filter(BehavioralSession.user_id == user_id).all()
+            
+            if sessions:
+                # Build training data from active sessions
+                training_data = {user_id: {}}
+                for session in sessions:
+                    if session.id in enhanced_processor.active_sessions:
+                        training_data[user_id][session.id] = enhanced_processor.active_sessions[session.id]
+                
+                # Train models
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                success = loop.run_until_complete(enhanced_processor.anomaly_engine.train_models(training_data))
+                
+                if success:
+                    user.profile_established = True
+                    db.commit()
+                    logger.info(f"Models trained for user {user_id}")
+                
+                db.close()
+                return success
+            
             return False
-        
-        # Get training data (simplified for hackathon)
-        sessions = db.query(BehavioralSession).filter(BehavioralSession.user_id == user_id).all()
-        
-        if sessions:
-            # Build training data from active sessions
-            training_data = {user_id: {}}
-            for session in sessions:
-                if session.id in real_time_processor.active_sessions:
-                    training_data[user_id][session.id] = real_time_processor.active_sessions[session.id]
             
-            # Train models
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            success = loop.run_until_complete(real_time_processor.anomaly_engine.train_models(training_data))
-            
-            if success:
-                user.profile_established = True
-                db.commit()
-                logger.info(f"Models trained for user {user_id}")
-            
-            db.close()
-            return success
-        
-        return False
-        
-    except Exception as e:
-        logger.error(f"Training failed: {str(e)}")
-        return False
+        except Exception as e:
+            logger.error(f"Training failed: {str(e)}")
+            return False
 
 # Database dependency
 def get_db():
@@ -694,7 +997,19 @@ def get_db():
 async def lifespan(app: FastAPI):
     """Application lifespan management"""
     # Startup
-    logger.info("Starting Behavioral Fraud Detection Backend...")
+    logger.info("Starting Enhanced Behavioral Fraud Detection Backend...")
+    
+    # Test Ollama connection
+    if AGENTS_AVAILABLE:
+        try:
+            ollama.list()
+            logger.info("Ollama connection successful")
+        except Exception as e:
+            logger.warning(f"Ollama connection failed: {e}")
+            logger.warning("Make sure Ollama is running: 'ollama serve'")
+    else:
+        logger.warning("Agent libraries not available")
+    
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables created")
     
@@ -707,7 +1022,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     version=settings.version,
-    description="Real-time behavioral fraud detection using ML",
+    description="Real-time behavioral fraud detection with AI agents",
     lifespan=lifespan
 )
 
@@ -720,42 +1035,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # Routes
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
-        "message": "Behavioral Fraud Detection API",
+        "message": "Enhanced Behavioral Fraud Detection API with AI Agents",
         "version": settings.version,
-        "docs": "/docs"
+        "docs": "/docs",
+        "agent_model": settings.ollama_model,
+        "agents_available": AGENTS_AVAILABLE
     }
 
 @app.get("/health")
 async def health_check():
-    """Health check"""
     try:
         db = SessionLocal()
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
         db.close()
+        
+        # Test Ollama connection
+        ollama_status = "disconnected"
+        if AGENTS_AVAILABLE:
+            try:
+                ollama.list()
+                ollama_status = "connected"
+            except:
+                ollama_status = "disconnected"
         
         return {
             "status": "healthy",
             "timestamp": datetime.utcnow().isoformat(),
             "database": "connected",
-            "version": settings.version
+            "ollama": ollama_status,
+            "agents_available": AGENTS_AVAILABLE,
+            "version": settings.version,
+            "active_sessions": len(enhanced_processor.active_sessions),
+            "events_processed": enhanced_processor.stats['events_processed']
         }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Health check failed: {str(e)}")
 
 @app.post("/api/users", response_model=UserResponse)
 async def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
-    """Create a new user"""
     try:
-        # Check if exists
         existing = db.query(User).filter(
             (User.username == user_data.username) | (User.email == user_data.email)
         ).first()
@@ -784,26 +1106,19 @@ async def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         db.rollback()
+        logger.error(f"User creation failed: {str(e)}")
         raise HTTPException(status_code=500, detail="User creation failed")
 
 @app.post("/api/sessions", response_model=SessionResponse)
-async def create_session(
-    session_data: SessionCreate, 
-    request: Request,
-    db: Session = Depends(get_db)
-):
-    """Create a new session"""
+async def create_session(session_data: SessionCreate, db: Session = Depends(get_db)):
     try:
         user = db.query(User).filter(User.id == session_data.user_id).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
-        # Get client info
-        client_ip = request.client.host if hasattr(request, 'client') else "unknown"
-        
         session = BehavioralSession(
             user_id=session_data.user_id,
-            ip_address=client_ip,
+            ip_address="127.0.0.1",
             device_fingerprint=session_data.device_fingerprint
         )
         
@@ -824,27 +1139,45 @@ async def create_session(
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Session creation failed")
+        logger.error(f"Session creation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/events", response_model=EventResponse)
 async def process_event(
     event_data: BehavioralEvent,
     db: Session = Depends(get_db)
 ):
-    """Process behavioral events"""
+    """Process behavioral events (original endpoint)"""
     try:
         event_dict = event_data.dict()
-        result = await real_time_processor.process_behavioral_event(event_dict, db)
+        result = await enhanced_processor.process_behavioral_event(event_dict, db)
         return EventResponse(**result)
         
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Event processing failed: {str(e)}")
         raise HTTPException(status_code=500, detail="Event processing failed")
+
+@app.post("/api/events/enhanced", response_model=EventResponse)
+async def process_event_with_agent(
+    event_data: BehavioralEvent,
+    db: Session = Depends(get_db)
+):
+    """Process behavioral events with AI agent analysis"""
+    try:
+        event_dict = event_data.dict()
+        result = await enhanced_processor.process_behavioral_event_with_agent(event_dict, db)
+        return EventResponse(**result)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Enhanced event processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Enhanced event processing failed")
 
 @app.get("/api/users/{user_id}", response_model=UserResponse)
 async def get_user(user_id: str, db: Session = Depends(get_db)):
-    """Get user information"""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -859,24 +1192,32 @@ async def get_user(user_id: str, db: Session = Depends(get_db)):
         risk_level=user.risk_level
     )
 
-@app.post("/api/profiles/{user_id}/build")
-async def build_user_profile(user_id: str, db: Session = Depends(get_db)):
-    """Trigger profile building"""
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+@app.get("/api/sessions/{session_id}")
+async def get_session(session_id: str, db: Session = Depends(get_db)):
+    session = db.query(BehavioralSession).filter(BehavioralSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
     
-    task = train_user_models.delay(user_id)
+    # Get real-time data if available
+    real_time_data = enhanced_processor.active_sessions.get(session_id, {})
     
     return {
-        "message": "Profile building initiated",
-        "task_id": task.id,
-        "user_id": user_id
+        "id": session.id,
+        "user_id": session.user_id,
+        "session_start": session.session_start.isoformat(),
+        "risk_score": session.risk_score,
+        "anomaly_count": session.anomaly_count,
+        "is_flagged": session.is_flagged,
+        "real_time": {
+            "keystrokes_count": len(real_time_data.get('keystrokes', [])),
+            "mouse_events_count": len(real_time_data.get('mouse', [])),
+            "current_risk_score": real_time_data.get('risk_score', 0.0),
+            "anomaly_count": real_time_data.get('anomaly_count', 0)
+        }
     }
 
 @app.get("/api/sessions/{session_id}/alerts")
 async def get_session_alerts(session_id: str, db: Session = Depends(get_db)):
-    """Get alerts for session"""
     session = db.query(BehavioralSession).filter(BehavioralSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -892,21 +1233,50 @@ async def get_session_alerts(session_id: str, db: Session = Depends(get_db)):
             "anomaly_type": alert.anomaly_type,
             "confidence_score": alert.confidence_score,
             "severity": alert.severity,
+            "details": json.loads(alert.details) if alert.details else {},
             "resolved": alert.resolved,
             "created_at": alert.created_at.isoformat()
         } for alert in alerts
     ]
 
+@app.post("/api/profiles/{user_id}/build")
+async def build_user_profile(user_id: str, db: Session = Depends(get_db)):
+    """Trigger profile building"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if CELERY_AVAILABLE:
+        task = train_user_models.delay(user_id)
+        return {
+            "message": "Profile building initiated",
+            "task_id": task.id,
+            "user_id": user_id
+        }
+    else:
+        return {
+            "message": "Profile building not available (Celery not installed)",
+            "user_id": user_id
+        }
+
 @app.get("/api/dashboard/stats")
-async def dashboard_stats(db: Session = Depends(get_db)):
-    """Get dashboard statistics"""
+async def enhanced_dashboard_stats(db: Session = Depends(get_db)):
     try:
         total_users = db.query(User).count()
         active_users = db.query(User).filter(User.is_active == True).count()
         total_sessions = db.query(BehavioralSession).count()
         total_alerts = db.query(AnomalyAlert).count()
+        unresolved_alerts = db.query(AnomalyAlert).filter(AnomalyAlert.resolved == False).count()
         
-        processor_stats = real_time_processor.stats.copy()
+        # Agent assessments count
+        total_agent_assessments = 0
+        if AGENTS_AVAILABLE:
+            try:
+                total_agent_assessments = db.query(AgentAssessment).count()
+            except:
+                pass  # Table might not exist yet
+        
+        processor_stats = enhanced_processor.stats.copy()
         uptime = datetime.utcnow() - processor_stats['last_reset']
         
         return {
@@ -916,58 +1286,129 @@ async def dashboard_stats(db: Session = Depends(get_db)):
             },
             "sessions": {
                 "total": total_sessions,
-                "active": len(real_time_processor.active_sessions)
+                "active": len(enhanced_processor.active_sessions)
             },
             "alerts": {
-                "total": total_alerts
+                "total": total_alerts,
+                "unresolved": unresolved_alerts
             },
             "processing": {
                 **processor_stats,
                 "uptime_seconds": uptime.total_seconds(),
                 "events_per_second": processor_stats['events_processed'] / max(uptime.total_seconds(), 1)
+            },
+            "ai_agent": {
+                "available": AGENTS_AVAILABLE,
+                "total_assessments": total_agent_assessments,
+                "agent_analyses_count": processor_stats.get('agent_analyses', 0),
+                "agent_ready": enhanced_processor.security_agent.available if enhanced_processor.security_agent else False,
+                "model": settings.ollama_model
+            },
+            "dependencies": {
+                "agents": AGENTS_AVAILABLE,
+                "celery": CELERY_AVAILABLE
             }
         }
         
     except Exception as e:
+        logger.error(f"Stats retrieval failed: {str(e)}")
         raise HTTPException(status_code=500, detail="Stats retrieval failed")
 
-# WebSocket endpoint
-@app.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: str):
-    """WebSocket for real-time updates"""
-    await websocket_manager.connect(websocket)
+# AI Agent endpoints
+@app.get("/api/test/agent-status")
+async def get_agent_status():
+    """Check AI agent status"""
+    if not AGENTS_AVAILABLE:
+        return {
+            "agent_available": False,
+            "error": "Agent libraries not installed",
+            "install_command": "pip install ollama langchain langchain-community"
+        }
+    
+    agent = enhanced_processor.security_agent
+    
+    # Test agent with a simple query
+    test_result = None
+    if agent and agent.available:
+        try:
+            test_data = {"session_stats": {"test": "connection"}}
+            test_result = await agent.analyze_behavioral_risk(test_data)
+        except Exception as e:
+            test_result = {"error": str(e)}
+    
+    return {
+        "agent_available": agent.available if agent else False,
+        "model": settings.ollama_model,
+        "ollama_base_url": settings.ollama_base_url,
+        "test_result": test_result,
+        "stats": {
+            "total_analyses": enhanced_processor.stats.get('agent_analyses', 0)
+        }
+    }
+
+@app.post("/api/agent/analyze-session/{session_id}")
+async def analyze_session_with_agent(session_id: str, db: Session = Depends(get_db)):
+    """Get AI agent analysis of a session"""
+    
+    if not AGENTS_AVAILABLE or not enhanced_processor.security_agent:
+        raise HTTPException(status_code=503, detail="AI agent not available")
+    
+    session_data = enhanced_processor.active_sessions.get(session_id)
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Active session not found")
     
     try:
-        await websocket.send_json({
-            "type": "connection",
-            "message": f"Connected for user {user_id}",
-            "timestamp": datetime.utcnow().isoformat()
-        })
+        assessment = await enhanced_processor.security_agent.analyze_behavioral_risk(session_data)
+        enhanced_processor.stats['agent_analyses'] += 1
         
-        while True:
-            data = await websocket.receive_json()
-            
-            if data.get('type') == 'ping':
-                await websocket.send_json({
-                    "type": "pong",
-                    "timestamp": datetime.utcnow().isoformat()
-                })
-                
-    except WebSocketDisconnect:
-        pass
-    finally:
-        websocket_manager.disconnect(websocket)
+        # Store the assessment
+        await enhanced_processor._store_agent_assessment(session_id, assessment, db)
+        
+        return {
+            "session_id": session_id,
+            "assessment": assessment,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent analysis failed: {str(e)}")
 
-# Testing endpoint
+@app.get("/api/agent/assessments/{session_id}")
+async def get_agent_assessments(session_id: str, db: Session = Depends(get_db)):
+    """Get all AI agent assessments for a session"""
+    
+    if not AGENTS_AVAILABLE:
+        return []
+    
+    try:
+        assessments = db.query(AgentAssessment).filter(
+            AgentAssessment.session_id == session_id
+        ).order_by(AgentAssessment.created_at.desc()).all()
+        
+        return [
+            {
+                "id": assessment.id,
+                "session_id": assessment.session_id,
+                "agent_type": assessment.agent_type,
+                "assessment_data": json.loads(assessment.assessment_data),
+                "confidence": assessment.confidence,
+                "created_at": assessment.created_at.isoformat()
+            } for assessment in assessments
+        ]
+    except Exception as e:
+        logger.error(f"Failed to get agent assessments: {str(e)}")
+        return []
+
+# Testing endpoints
 @app.post("/api/test/generate-events")
 async def generate_test_events(
     user_id: str,
     session_id: str,
     event_count: int = 50,
     anomalous: bool = False,
+    use_agent: bool = False,
     db: Session = Depends(get_db)
 ):
-    """Generate test events for demo"""
+    """Generate test events with optional AI agent analysis"""
     try:
         session = db.query(BehavioralSession).filter(BehavioralSession.id == session_id).first()
         if not session:
@@ -976,10 +1417,14 @@ async def generate_test_events(
         events_created = 0
         current_time = time.time()
         
+        # Choose endpoint based on use_agent parameter
+        endpoint_func = process_event_with_agent if use_agent and AGENTS_AVAILABLE else process_event
+        
         # Generate keystroke events
-        for i in range(event_count // 2):
+        keystroke_count = event_count // 2
+        for i in range(keystroke_count):
             if anomalous:
-                dwell_time = np.random.uniform(5, 15)  # Very short (bot-like)
+                dwell_time = np.random.uniform(5, 15)  # Bot-like
                 flight_time = np.random.uniform(1, 10)
             else:
                 dwell_time = np.random.uniform(80, 150)  # Normal
@@ -996,17 +1441,21 @@ async def generate_test_events(
                 timestamp=current_time + i * 0.1
             )
             
-            await process_event(event_data, db)
+            await endpoint_func(event_data, db)
             events_created += 1
         
         # Generate mouse events
+        mouse_count = event_count - keystroke_count
         x, y = 500, 500
-        for i in range(event_count // 2):
+        for i in range(mouse_count):
             if anomalous:
-                dx, dy = np.random.randint(-200, 200, 2)  # Erratic
+                if i % 5 == 0:
+                    dx, dy = 10, 0  # Linear patterns
+                else:
+                    dx, dy = np.random.randint(-200, 200, 2)
                 velocity = np.random.uniform(800, 1500)
             else:
-                dx, dy = np.random.randint(-30, 30, 2)  # Normal
+                dx, dy = np.random.randint(-30, 30, 2)
                 velocity = np.random.uniform(50, 300)
             
             x = max(0, min(1920, x + dx))
@@ -1021,30 +1470,169 @@ async def generate_test_events(
                 velocity=velocity,
                 acceleration=np.random.uniform(-100, 100),
                 mouse_event_type='move',
-                timestamp=current_time + (event_count // 2) * 0.1 + i * 0.05
+                timestamp=current_time + keystroke_count * 0.1 + i * 0.05
             )
             
-            await process_event(event_data, db)
+            await endpoint_func(event_data, db)
             events_created += 1
         
         return {
             "message": f"Generated {events_created} test events",
             "anomalous": anomalous,
-            "session_id": session_id
+            "agent_analysis": use_agent and AGENTS_AVAILABLE,
+            "session_id": session_id,
+            "keystroke_events": keystroke_count,
+            "mouse_events": mouse_count
         }
         
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"Test generation failed: {str(e)}")
         raise HTTPException(status_code=500, detail="Test generation failed")
+
+@app.post("/api/test/reset-session/{session_id}")
+async def reset_session(session_id: str):
+    """Reset a session's real-time data"""
+    if session_id in enhanced_processor.active_sessions:
+        del enhanced_processor.active_sessions[session_id]
+        enhanced_processor.stats['sessions_active'] = max(0, enhanced_processor.stats['sessions_active'] - 1)
+        return {"message": f"Session {session_id} reset successfully"}
+    else:
+        raise HTTPException(status_code=404, detail="Active session not found")
+
+@app.get("/api/test/sessions")
+async def list_active_sessions():
+    """List all active sessions"""
+    sessions = []
+    for session_id, data in enhanced_processor.active_sessions.items():
+        sessions.append({
+            "session_id": session_id,
+            "user_id": data['user_id'],
+            "start_time": data['start_time'],
+            "keystrokes": len(data['keystrokes']),
+            "mouse_events": len(data['mouse']),
+            "risk_score": data['risk_score'],
+            "anomaly_count": data['anomaly_count']
+        })
+    
+    return {
+        "active_sessions": sessions,
+        "total_count": len(sessions)
+    }
+
+# Admin endpoints
+@app.post("/api/admin/reset-stats")
+async def reset_stats():
+    """Reset processing statistics"""
+    enhanced_processor.stats = {
+        'events_processed': 0,
+        'anomalies_detected': 0,
+        'agent_analyses': 0,
+        'sessions_active': len(enhanced_processor.active_sessions),
+        'last_reset': datetime.utcnow()
+    }
+    return {"message": "Statistics reset successfully"}
+
+@app.get("/api/admin/models/status")
+async def model_status():
+    """Get ML model status"""
+    engine = enhanced_processor.anomaly_engine
+    return {
+        "models_trained": engine.models_trained,
+        "baseline_profiles_count": len(engine.baseline_profiles),
+        "isolation_forest_trained": engine.isolation_forest is not None,
+        "one_class_svm_trained": engine.one_class_svm is not None,
+        "scaler_fitted": hasattr(engine.scaler, 'mean_') and engine.scaler.mean_ is not None,
+        "agents_available": AGENTS_AVAILABLE,
+        "agent_ready": enhanced_processor.security_agent.available if enhanced_processor.security_agent else False
+    }
+
+# WebSocket endpoint
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await websocket_manager.connect(websocket)
+    
+    try:
+        await websocket.send_json({
+            "type": "connection",
+            "message": f"Connected for user {user_id}",
+            "timestamp": datetime.utcnow().isoformat(),
+            "agent_enabled": enhanced_processor.security_agent.available if enhanced_processor.security_agent else False
+        })
+        
+        while True:
+            data = await websocket.receive_json()
+            
+            if data.get('type') == 'ping':
+                await websocket.send_json({
+                    "type": "pong",
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            elif data.get('type') == 'get_agent_analysis':
+                session_id = data.get('session_id')
+                if session_id and session_id in enhanced_processor.active_sessions:
+                    if enhanced_processor.security_agent and enhanced_processor.security_agent.available:
+                        try:
+                            analysis = await enhanced_processor.security_agent.analyze_behavioral_risk(
+                                enhanced_processor.active_sessions[session_id]
+                            )
+                            await websocket.send_json({
+                                "type": "agent_analysis",
+                                "session_id": session_id,
+                                "analysis": analysis
+                            })
+                        except Exception as e:
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": f"Agent analysis failed: {str(e)}"
+                            })
+                    else:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "AI agent not available"
+                        })
+                
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for user {user_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error for user {user_id}: {str(e)}")
+    finally:
+        websocket_manager.disconnect(websocket)
+
+# Error handlers
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=404,
+        content={"detail": "Resource not found", "path": str(request.url)}
+    )
+
+@app.exception_handler(500)
+async def internal_server_error_handler(request: Request, exc: HTTPException):
+    logger.error(f"Internal server error: {exc.detail}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "timestamp": datetime.utcnow().isoformat()}
+    )
 
 # Run the app
 if __name__ == "__main__":
+    # Create necessary directories
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
     
+    logger.info("Starting Enhanced Behavioral Fraud Detection Backend with AI Agents...")
+    
+    # Check dependencies
+    if not AGENTS_AVAILABLE:
+        logger.warning("Agent libraries not available. Install with: pip install ollama langchain langchain-community")
+    
+    if not CELERY_AVAILABLE:
+        logger.warning("Celery not available. Background tasks disabled. Install with: pip install redis celery")
+    
     uvicorn.run(
-        "app:app",
+        app,  # Direct reference to app variable
         host="0.0.0.0",
         port=8000,
         reload=True,
